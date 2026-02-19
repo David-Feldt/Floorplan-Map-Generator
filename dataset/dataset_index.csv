@@ -1,0 +1,3 @@
+hotel_name,floor,source_url,license,pgm_path,width_px,height_px,resolution
+White_House_West_Wing,1,https://commons.wikimedia.org/wiki/File:White_House_West_Wing_-_1st_Floor_with_the_Oval_Office_highlighted.png,Public Domain,dataset/White_House_West_Wing/floor_1/map.pgm,1474,873,0.05
+Cleveland_Union_Terminal,1,https://commons.wikimedia.org/wiki/File:Cleveland_Union_Terminal_floor_plan.jpg,Public Domain,dataset/Cleveland_Union_Terminal/floor_1/map.pgm,2784,2144,0.05

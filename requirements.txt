@@ -1,0 +1,7 @@
+opencv-python-headless
+numpy
+requests
+pytesseract
+Pillow
+pyyaml
+scikit-image
