@@ -122,11 +122,13 @@ def process_image(input_path, output_pgm_path, wall_sensitivity=3.0):
     # (lines survive, text characters don't). Erase everything in the box
     # EXCEPT the line pixels. This keeps walls, removes all text.
     phrase_boxes = []
+    ocr_word_heights = []
     try:
         from ocr_visualize import extract_words, group_nearby_words
         words = extract_words(input_path, min_conf=20)
+        ocr_word_heights = [int(wd["h"]) for wd in words if int(wd["h"]) > 5]
         phrases = group_nearby_words(words)
-        pad = max(6, int(4 * scale))
+        pad = max(12, int(8 * scale))
         for wd in phrases:
             bx, by, bw, bh = int(wd["x"]), int(wd["y"]), int(wd["w"]), int(wd["h"])
             phrase_boxes.append((bx - pad, by - pad, bx + bw + pad, by + bh + pad))
@@ -135,61 +137,124 @@ def process_image(input_path, output_pgm_path, wall_sensitivity=3.0):
 
     opened = binary.copy()
 
-    # Directional line kernels — anything that survives these is a line, not text
-    line_k = max(5, int(3 * scale)) | 1
-    k_h = cv2.getStructuringElement(cv2.MORPH_RECT, (line_k, 1))
-    k_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, line_k))
-    diag_k = max(5, int(3 * scale))
     def _diag_kernel(length, direction):
         k = np.zeros((length, length), dtype=np.uint8)
         for ii in range(length):
             jj = ii if direction == 1 else length - 1 - ii
             k[ii, jj] = 1
         return k
-    k_d1 = _diag_kernel(diag_k, 1)
-    k_d2 = _diag_kernel(diag_k, -1)
+
+    base_line_k = max(15, int(10 * scale)) | 1
+
+    def _directional_lines(region, lk):
+        """Find pixels surviving directional opening in H/V/diagonal directions."""
+        kh = cv2.getStructuringElement(cv2.MORPH_RECT, (lk, 1))
+        kv = cv2.getStructuringElement(cv2.MORPH_RECT, (1, lk))
+        dk = _diag_kernel(lk, 1)
+        dk2 = _diag_kernel(lk, -1)
+        return cv2.bitwise_or(
+            cv2.bitwise_or(
+                cv2.morphologyEx(region, cv2.MORPH_OPEN, kh),
+                cv2.morphologyEx(region, cv2.MORPH_OPEN, kv)),
+            cv2.bitwise_or(
+                cv2.morphologyEx(region, cv2.MORPH_OPEN, dk),
+                cv2.morphologyEx(region, cv2.MORPH_OPEN, dk2)))
+
+    # Per-box text removal uses multiple signals:
+    #  A) Directional opening with base_line_k — identifies line segments
+    #  B) Boundary connectivity — CCs touching box edge are walls
+    #  C) CC shape analysis — compact small CCs are text, elongated ones are walls
+    text_char_max = max(200, int(100 * scale * scale))
 
     for (bx1, by1, bx2, by2) in phrase_boxes:
         bx1c, by1c = max(0, bx1), max(0, by1)
         bx2c, by2c = min(w, bx2), min(h, by2)
         if bx2c <= bx1c or by2c <= by1c:
             continue
-        # Extract the box region with margin for directional opening
-        margin = line_k + 2
+        box_slice = opened[by1c:by2c, bx1c:bx2c]
+        if box_slice.sum() == 0:
+            continue
+        box_h, box_w = box_slice.shape
+
+        # A) Directional opening — features surviving are wall-like lines
+        margin = base_line_k + 2
         rx1, ry1 = max(0, bx1c - margin), max(0, by1c - margin)
         rx2, ry2 = min(w, bx2c + margin), min(h, by2c + margin)
         region = opened[ry1:ry2, rx1:rx2].copy()
-        # Find lines in region via directional opening
-        lines_in_region = cv2.bitwise_or(
-            cv2.bitwise_or(
-                cv2.morphologyEx(region, cv2.MORPH_OPEN, k_h),
-                cv2.morphologyEx(region, cv2.MORPH_OPEN, k_v)),
-            cv2.bitwise_or(
-                cv2.morphologyEx(region, cv2.MORPH_OPEN, k_d1),
-                cv2.morphologyEx(region, cv2.MORPH_OPEN, k_d2)))
+        lines_in_region = _directional_lines(region, base_line_k)
         line_safe = cv2.dilate(lines_in_region, np.ones((3, 3), np.uint8))
-        oy1, oy2 = by1c - ry1, by1c - ry1 + (by2c - by1c)
-        ox1, ox2 = bx1c - rx1, bx1c - rx1 + (bx2c - bx1c)
-        safe_content = line_safe[oy1:oy2, ox1:ox2]
-        # Find non-line pixels in the box (candidate text pixels)
-        box_slice = opened[by1c:by2c, bx1c:bx2c]
-        candidate_text = cv2.subtract(box_slice, safe_content)
-        # Only erase candidate pixels that belong to small CCs (actual text),
-        # leave everything else untouched.
+        oy1 = by1c - ry1
+        oy2 = oy1 + box_h
+        ox1 = bx1c - rx1
+        ox2 = ox1 + box_w
+        safe_directional = line_safe[oy1:oy2, ox1:ox2]
+
+        # B) Boundary connectivity — CCs touching box edge are walls
+        n_box, box_labels, box_stats, _ = cv2.connectedComponentsWithStats(
+            box_slice, connectivity=8)
+        safe_boundary = np.zeros_like(box_slice)
+        for bi in range(1, n_box):
+            cc_mask = (box_labels == bi)
+            touches_edge = (cc_mask[0, :].any() or cc_mask[-1, :].any() or
+                            cc_mask[:, 0].any() or cc_mask[:, -1].any())
+            if touches_edge:
+                bbw = box_stats[bi, cv2.CC_STAT_WIDTH]
+                bbh = box_stats[bi, cv2.CC_STAT_HEIGHT]
+                bmax = max(bbw, bbh)
+                bmin = max(min(bbw, bbh), 1)
+                if bmax / bmin >= 2.5 or (cc_mask & (safe_directional > 0)).any():
+                    safe_boundary[cc_mask] = 255
+
+        combined_safe = cv2.bitwise_or(safe_directional, safe_boundary)
+
+        # C) CC shape filter on remaining candidates — only erase compact/small CCs
+        candidate_text = cv2.subtract(box_slice, combined_safe)
         if candidate_text.sum() == 0:
             continue
-        n_tc, tc_labels, tc_stats, _ = cv2.connectedComponentsWithStats(candidate_text, connectivity=8)
-        text_char_max = max(40, int(20 * scale * scale))
+        n_tc, tc_labels, tc_stats, _ = cv2.connectedComponentsWithStats(
+            candidate_text, connectivity=8)
         for ti in range(1, n_tc):
             ta = tc_stats[ti, cv2.CC_STAT_AREA]
             tw = tc_stats[ti, cv2.CC_STAT_WIDTH]
             th = tc_stats[ti, cv2.CC_STAT_HEIGHT]
             tmax = max(tw, th)
             tmin = max(min(tw, th), 1)
-            # Text character: small area, or compact shape
-            if ta <= text_char_max or (tmax / tmin < 2.0 and ta <= text_char_max * 3):
-                erase_mask = tc_labels == ti
-                box_slice[erase_mask] = 0
+            aspect = tmax / tmin
+            is_text = (ta <= text_char_max and aspect < 4.0) or \
+                      (ta <= text_char_max * 2 and aspect < 2.0)
+            if is_text:
+                box_slice[tc_labels == ti] = 0
+
+    # ── 4c. Global text cleanup — wall-connectivity approach ────────────
+    # Find core walls (very long linear features), then mark every CC that
+    # touches the core as wall-connected.  Erase small isolated CCs that
+    # don't belong to the wall network (remaining text remnants).
+    core_lk = max(25, int(15 * scale)) | 1
+    ck_h = cv2.getStructuringElement(cv2.MORPH_RECT, (core_lk, 1))
+    ck_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, core_lk))
+    ck_d1 = _diag_kernel(max(25, int(15 * scale)), 1)
+    ck_d2 = _diag_kernel(max(25, int(15 * scale)), -1)
+    core_walls = cv2.bitwise_or(
+        cv2.bitwise_or(
+            cv2.morphologyEx(opened, cv2.MORPH_OPEN, ck_h),
+            cv2.morphologyEx(opened, cv2.MORPH_OPEN, ck_v)),
+        cv2.bitwise_or(
+            cv2.morphologyEx(opened, cv2.MORPH_OPEN, ck_d1),
+            cv2.morphologyEx(opened, cv2.MORPH_OPEN, ck_d2)))
+    # Dilate core to bridge small gaps at junctions
+    bridge_k = max(3, int(2 * scale))
+    core_bridged = cv2.dilate(core_walls, np.ones((bridge_k, bridge_k), np.uint8))
+    # Mark CCs in opened that overlap with the core wall network
+    n_cc_all, cc_labels_all, cc_stats_all, _ = cv2.connectedComponentsWithStats(
+        opened, connectivity=8)
+    max_isolated_area = max(800, int(500 * scale * scale))
+    for i in range(1, n_cc_all):
+        cc_mask = (cc_labels_all == i)
+        if (cc_mask & (core_bridged > 0)).any():
+            continue  # connected to wall network — keep
+        area = cc_stats_all[i, cv2.CC_STAT_AREA]
+        if area <= max_isolated_area:
+            opened[cc_mask] = 0
 
     # ── 5. Dot removal ───────────────────────────────────────────────────
     dot_max_area = max(8, int(5 * scale * scale))
@@ -206,14 +271,10 @@ def process_image(input_path, output_pgm_path, wall_sensitivity=3.0):
 
     filtered = opened
 
-    # ── 6b. Stair detection ──────────────────────────────────────────────
-    STAIR_PIXEL = 64
-    stair_mask = np.zeros_like(filtered)
-
     # ── 7a. Uniform thin walls ───────────────────────────────────────────
     # Skip skeletonization (it destroys thin segments). Instead:
     # erode thick walls to thin them, then re-dilate to uniform width.
-    wall_target = max(2, int(1.5 * scale))
+    wall_target = max(1, int(1.0 * scale))
     # Erode to remove thickness, then dilate back to uniform
     erode_k = max(1, int(1 * scale))
     erode_kernel = np.ones((erode_k, erode_k), np.uint8)
@@ -280,13 +341,20 @@ def process_image(input_path, output_pgm_path, wall_sensitivity=3.0):
     wall_adjacent = cv2.dilate((thin_walls > 0).astype(np.uint8), np.ones((3, 3), np.uint8))
     door_on_border = (door_mask > 0) & (wall_adjacent > 0)
     result[door_on_border] = DOOR_PIXEL
-    # Stairs
-    result[stair_mask > 0] = STAIR_PIXEL
 
-    # 9. Save as PGM
-    os.makedirs(os.path.dirname(output_pgm_path) or ".", exist_ok=True)
+    # 9. Save as PGM and walls-only PNG
+    out_dir = os.path.dirname(output_pgm_path)
+    os.makedirs(out_dir or ".", exist_ok=True)
     pil_img = Image.fromarray(result)
     pil_img.save(output_pgm_path, format="PPM")
+
+    # Walls-only view: map_walls.png (no room labels)
+    walls_png = os.path.join(out_dir, "map_walls.png")
+    bgr = np.zeros((*result.shape, 3), dtype=np.uint8)
+    bgr[:] = (255, 255, 255)
+    bgr[result <= 1] = (0, 0, 0)
+    bgr[(result >= 126) & (result <= 130)] = (42, 42, 139)
+    cv2.imwrite(walls_png, bgr)
 
     h_out, w_out = result.shape
     print(f"  Processed: {w_out}x{h_out} → {output_pgm_path}")
@@ -688,6 +756,13 @@ def process_entry(hotel_name, floor, source_url, license_str, resolution=0.05,
     if not generate_waypoints_with_polygons(raw_path, floor_dir, resolution=resolution):
         generate_waypoints(raw_path, floor_dir, resolution=resolution)
 
+    # Step 5: Generate rooms-labeled visualization
+    try:
+        from view_pgm_rooms import draw_rooms_view
+        draw_rooms_view(floor_dir, output_path=os.path.join(floor_dir, "map_rooms_labeled.png"))
+    except Exception as e:
+        print(f"  [WARN] Room visualization failed: {e}")
+
     return {
         "hotel_name": hotel_name,
         "floor": floor,
@@ -852,6 +927,11 @@ def main():
         generate_map_yaml(out_dir, resolution=args.resolution)
         if not generate_waypoints_with_polygons(args.image, out_dir, resolution=args.resolution):
             generate_waypoints(args.image, out_dir, resolution=args.resolution)
+        try:
+            from view_pgm_rooms import draw_rooms_view
+            draw_rooms_view(out_dir, output_path=os.path.join(out_dir, "map_rooms_labeled.png"))
+        except Exception as e:
+            print(f"  [WARN] Room visualization failed: {e}")
         print("\nDone.")
     else:
         # Batch mode

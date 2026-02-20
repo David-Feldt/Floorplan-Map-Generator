@@ -11,10 +11,18 @@ Convert hotel floor plans from [Wikimedia Commons](https://commons.wikimedia.org
 dataset/
 └── {Hotel_Name}/
     └── floor_{n}/
-        ├── map.pgm        # Occupancy grid (white=free, black=wall)
-        ├── map.yaml       # ROS map_server config
-        └── waypoints.yaml # [Phase 2] Labeled room nav goals
+        ├── map.pgm              # Occupancy grid (white=free, black=wall, 128=door)
+        ├── map.yaml             # ROS map_server config
+        ├── map_walls.png        # Walls-only view (no labels)
+        ├── map_rooms_labeled.png # Walls + room regions and labels
+        └── waypoints.yaml       # [Phase 2] Labeled room nav goals
 ```
+
+### Map rooms labeled
+
+Walls plus room regions and labels (`map_rooms_labeled.png`):
+
+![Map rooms labeled (White House West Wing)](dataset/White_House_West_Wing/floor_1/map_rooms_labeled.png)
 
 ## map.yaml
 ```yaml
