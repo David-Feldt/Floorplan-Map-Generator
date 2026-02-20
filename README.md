@@ -18,9 +18,6 @@ dataset/
         └── waypoints.yaml       # [Phase 2] Labeled room nav goals
 ```
 
-### Map rooms labeled
-
-Walls plus room regions and labels (`map_rooms_labeled.png`):
 
 ![Map rooms labeled (White House West Wing)](dataset/White_House_West_Wing/floor_1/map_rooms_labeled.png)
 
@@ -33,6 +30,8 @@ negate: 0
 occupied_thresh: 0.65
 free_thresh: 0.196
 ```
+
+
 
 ## waypoints.yaml (Phase 2)
 ```yaml
